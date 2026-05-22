@@ -30,7 +30,6 @@ evaluate_results/
 *.pt
 *.bin
 *.pickle
-*.txt
 
 # Other uncheckable file types
 *.zip
