@@ -75,6 +75,70 @@ def _latent_features(inputs: dict) -> tuple[torch.Tensor, torch.Tensor]:
     return state_feat, future_feat
 
 
+def _build_response_batch(model, batch, device: str):
+    with torch.no_grad():
+        inputs = model.build_inputs(batch, tiled=False)
+        state_feat, future_feat = _latent_features(inputs)
+        action_feat = inputs["action"].float().flatten(1)
+
+    anchor_idx, nn_idx, pair_dist = _nearest_pairs(state_feat)
+    delta_action = action_feat[nn_idx] - action_feat[anchor_idx]
+    target_delta_future = future_feat[nn_idx] - future_feat[anchor_idx]
+    return {
+        "state": state_feat[anchor_idx].to(device),
+        "action": action_feat[anchor_idx].to(device),
+        "delta_action": delta_action.to(device),
+        "target_delta_future": target_delta_future.to(device),
+        "pair_dist": pair_dist,
+    }
+
+
+def _response_metrics(pred_delta_future: torch.Tensor, target_delta_future: torch.Tensor) -> dict[str, float]:
+    pred = pred_delta_future.float()
+    target = target_delta_future.float()
+    mse = F.mse_loss(pred, target).detach()
+    zero_mse = target.pow(2).mean().detach().clamp(min=1e-12)
+    cosine = F.cosine_similarity(pred, target, dim=-1).mean().detach()
+    pred_norm = pred.norm(dim=-1).mean().detach()
+    target_norm = target.norm(dim=-1).mean().detach()
+    return {
+        "mse": float(mse.item()),
+        "rel_mse": float((mse / zero_mse).item()),
+        "cos": float(cosine.item()),
+        "pred_norm": float(pred_norm.item()),
+        "target_norm": float(target_norm.item()),
+    }
+
+
+@torch.no_grad()
+def _evaluate(head, model, loader, device: str, num_batches: int):
+    if num_batches <= 0:
+        return None
+    head.eval()
+    metrics = []
+    data_iter = iter(loader)
+    for _ in range(num_batches):
+        try:
+            batch = next(data_iter)
+        except StopIteration:
+            data_iter = iter(loader)
+            batch = next(data_iter)
+        response_batch = _build_response_batch(model, batch, device=device)
+        pred = head(
+            response_batch["state"],
+            response_batch["action"],
+            response_batch["delta_action"],
+        )
+        metric = _response_metrics(pred, response_batch["target_delta_future"])
+        metric["pair_dist"] = float(response_batch["pair_dist"].mean().item())
+        metrics.append(metric)
+    head.train()
+    return {
+        key: sum(m[key] for m in metrics) / len(metrics)
+        for key in metrics[0].keys()
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train a lightweight Action Response Field probe on FastWAM latents.")
     parser.add_argument("--config", default="configs/train.yaml")
@@ -87,6 +151,8 @@ def main():
     parser.add_argument("--rank", type=int, default=16)
     parser.add_argument("--device", default=None)
     parser.add_argument("--log-every", type=int, default=10)
+    parser.add_argument("--eval-every", type=int, default=50)
+    parser.add_argument("--eval-batches", type=int, default=4)
     parser.add_argument("--save-path", default="runs/crf_probe.pt")
     args = parser.parse_args()
 
@@ -96,6 +162,7 @@ def main():
 
     dataset = instantiate(cfg.data.train)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, drop_last=True)
+    eval_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, drop_last=True)
 
     device = args.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
     mixed_precision = _normalize_mixed_precision(str(cfg.mixed_precision))
@@ -116,14 +183,11 @@ def main():
             data_iter = iter(loader)
             batch = next(data_iter)
 
-        with torch.no_grad():
-            inputs = model.build_inputs(batch, tiled=False)
-            state_feat, future_feat = _latent_features(inputs)
-            action_feat = inputs["action"].float().flatten(1)
-
-        anchor_idx, nn_idx, pair_dist = _nearest_pairs(state_feat)
-        delta_action = action_feat[nn_idx] - action_feat[anchor_idx]
-        target_delta_future = future_feat[nn_idx] - future_feat[anchor_idx]
+        response_batch = _build_response_batch(model, batch, device=device)
+        state_feat = response_batch["state"]
+        action_feat = response_batch["action"]
+        delta_action = response_batch["delta_action"]
+        target_delta_future = response_batch["target_delta_future"]
 
         if head is None:
             head = LowRankActionResponseHead(
@@ -141,27 +205,56 @@ def main():
             )
 
         pred_delta_future = head(
-            state_feat[anchor_idx].to(device),
-            action_feat[anchor_idx].to(device),
-            delta_action.to(device),
+            state_feat,
+            action_feat,
+            delta_action,
         )
-        target_delta_future = target_delta_future.to(device)
         loss = F.mse_loss(pred_delta_future.float(), target_delta_future.float())
-        cosine = F.cosine_similarity(pred_delta_future.float(), target_delta_future.float(), dim=-1).mean()
+        train_metrics = _response_metrics(pred_delta_future, target_delta_future)
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
 
-        running.append((float(loss.detach().item()), float(cosine.detach().item()), float(pair_dist.mean().item())))
-        if step == 1 or step % args.log_every == 0:
-            mean_loss = sum(x[0] for x in running[-args.log_every:]) / min(len(running), args.log_every)
-            mean_cos = sum(x[1] for x in running[-args.log_every:]) / min(len(running), args.log_every)
-            mean_pair_dist = sum(x[2] for x in running[-args.log_every:]) / min(len(running), args.log_every)
-            print(
-                f"step={step:05d} loss={mean_loss:.6f} "
-                f"cos={mean_cos:.4f} pair_dist={mean_pair_dist:.4f}"
+        running.append(
+            (
+                train_metrics["mse"],
+                train_metrics["rel_mse"],
+                train_metrics["cos"],
+                train_metrics["pred_norm"],
+                train_metrics["target_norm"],
+                float(response_batch["pair_dist"].mean().item()),
             )
+        )
+        if step == 1 or step % args.log_every == 0:
+            denom = min(len(running), args.log_every)
+            mean_loss = sum(x[0] for x in running[-args.log_every:]) / denom
+            mean_rel_mse = sum(x[1] for x in running[-args.log_every:]) / denom
+            mean_cos = sum(x[2] for x in running[-args.log_every:]) / denom
+            mean_pred_norm = sum(x[3] for x in running[-args.log_every:]) / denom
+            mean_target_norm = sum(x[4] for x in running[-args.log_every:]) / denom
+            mean_pair_dist = sum(x[5] for x in running[-args.log_every:]) / denom
+            print(
+                f"step={step:05d} train_mse={mean_loss:.6f} train_rel_mse={mean_rel_mse:.4f} "
+                f"train_cos={mean_cos:.4f} pred_norm={mean_pred_norm:.4f} "
+                f"target_norm={mean_target_norm:.4f} pair_dist={mean_pair_dist:.4f}"
+            )
+        if step == 1 or (args.eval_every > 0 and step % args.eval_every == 0):
+            eval_metrics = _evaluate(
+                head=head,
+                model=model,
+                loader=eval_loader,
+                device=device,
+                num_batches=args.eval_batches,
+            )
+            if eval_metrics is not None:
+                print(
+                    f"eval@{step:05d} mse={eval_metrics['mse']:.6f} "
+                    f"rel_mse={eval_metrics['rel_mse']:.4f} cos={eval_metrics['cos']:.4f} "
+                    f"pred_norm={eval_metrics['pred_norm']:.4f} "
+                    f"target_norm={eval_metrics['target_norm']:.4f} "
+                    f"pair_dist={eval_metrics['pair_dist']:.4f}"
+                )
 
     save_path = Path(args.save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
