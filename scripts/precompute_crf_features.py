@@ -42,6 +42,8 @@ def main():
     parser.add_argument("--max-samples", type=int, default=10000)
     parser.add_argument("--device", default=None)
     parser.add_argument("--save-path", default="runs/crf_features_libero.pt")
+    parser.add_argument("--shard-dir", default=None, help="Optional directory for intermediate feature shards.")
+    parser.add_argument("--save-every", type=int, default=0, help="Save one shard every N rows when shard-dir is set.")
     args = parser.parse_args()
 
     register_default_resolvers()
@@ -64,6 +66,40 @@ def main():
     idx_chunks = []
     prompt_chunks = []
     seen = 0
+    shard_id = 0
+
+    shard_dir = Path(args.shard_dir) if args.shard_dir else None
+    if shard_dir is not None:
+        shard_dir.mkdir(parents=True, exist_ok=True)
+
+    def flush_shard(force: bool = False):
+        nonlocal shard_id, state_chunks, action_chunks, future_chunks, idx_chunks, prompt_chunks
+        if shard_dir is None or not state_chunks:
+            return
+        rows = sum(chunk.shape[0] for chunk in state_chunks)
+        if not force and (args.save_every <= 0 or rows < args.save_every):
+            return
+        payload = {
+            "state_feat": torch.cat(state_chunks, dim=0),
+            "action_feat": torch.cat(action_chunks, dim=0),
+            "future_feat": torch.cat(future_chunks, dim=0),
+            "task": args.task,
+            "config": args.config,
+            "shard_id": shard_id,
+        }
+        if idx_chunks:
+            payload["idx"] = torch.cat(idx_chunks, dim=0)
+        if prompt_chunks:
+            payload["prompt"] = prompt_chunks
+        shard_path = shard_dir / f"shard_{shard_id:05d}.pt"
+        torch.save(payload, shard_path)
+        print(f"Saved shard {shard_id} with {payload['state_feat'].shape[0]} rows to {shard_path}")
+        shard_id += 1
+        state_chunks = []
+        action_chunks = []
+        future_chunks = []
+        idx_chunks = []
+        prompt_chunks = []
 
     progress_total = min(len(dataset), args.max_samples) if args.max_samples > 0 else len(dataset)
     pbar = tqdm(total=progress_total, desc="Precomputing CRF features")
@@ -88,21 +124,41 @@ def main():
 
         seen += take
         pbar.update(take)
+        flush_shard(force=False)
         if seen >= progress_total:
             break
     pbar.close()
+    flush_shard(force=True)
 
-    payload = {
-        "state_feat": torch.cat(state_chunks, dim=0),
-        "action_feat": torch.cat(action_chunks, dim=0),
-        "future_feat": torch.cat(future_chunks, dim=0),
-        "task": args.task,
-        "config": args.config,
-    }
-    if idx_chunks:
-        payload["idx"] = torch.cat(idx_chunks, dim=0)
-    if prompt_chunks:
-        payload["prompt"] = prompt_chunks
+    if shard_dir is not None:
+        shard_paths = sorted(shard_dir.glob("shard_*.pt"))
+        if not shard_paths:
+            raise RuntimeError(f"No shards were written to {shard_dir}")
+        shards = [torch.load(path, map_location="cpu") for path in shard_paths]
+        payload = {
+            "state_feat": torch.cat([s["state_feat"] for s in shards], dim=0),
+            "action_feat": torch.cat([s["action_feat"] for s in shards], dim=0),
+            "future_feat": torch.cat([s["future_feat"] for s in shards], dim=0),
+            "task": args.task,
+            "config": args.config,
+            "shard_dir": str(shard_dir),
+        }
+        if all("idx" in s for s in shards):
+            payload["idx"] = torch.cat([s["idx"] for s in shards], dim=0)
+        if all("prompt" in s for s in shards):
+            payload["prompt"] = [prompt for s in shards for prompt in s["prompt"]]
+    else:
+        payload = {
+            "state_feat": torch.cat(state_chunks, dim=0),
+            "action_feat": torch.cat(action_chunks, dim=0),
+            "future_feat": torch.cat(future_chunks, dim=0),
+            "task": args.task,
+            "config": args.config,
+        }
+        if idx_chunks:
+            payload["idx"] = torch.cat(idx_chunks, dim=0)
+        if prompt_chunks:
+            payload["prompt"] = prompt_chunks
 
     save_path = Path(args.save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
