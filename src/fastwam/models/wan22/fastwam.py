@@ -10,6 +10,12 @@ from fastwam.utils.logging_config import get_logger
 from .action_dit import ActionDiT
 from .helpers.loader import load_wan22_ti2v_5b_components
 from .mot import MoT
+from .response_field import (
+    TokenResponseFieldHead,
+    latent_tokens,
+    nearest_response_batch,
+    response_metrics,
+)
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
 
 logger = get_logger(__name__)
@@ -38,6 +44,8 @@ class FastWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        loss_lambda_response: float = 0.0,
+        response_field_config: Optional[dict[str, Any]] = None,
     ):
         super().__init__()
         self.video_expert = video_expert
@@ -84,6 +92,20 @@ class FastWAM(torch.nn.Module):
         self.torch_dtype = torch_dtype
         self.loss_lambda_video = float(loss_lambda_video)
         self.loss_lambda_action = float(loss_lambda_action)
+        self.loss_lambda_response = float(loss_lambda_response)
+        self.response_field = None
+        self.response_field_config = dict(response_field_config or {})
+        if bool(self.response_field_config.get("enabled", False)):
+            action_horizon = int(self.response_field_config.get("action_horizon", 32))
+            action_flat_dim = int(action_expert.action_dim) * action_horizon
+            latent_dim = int(getattr(self.vae.model, "z_dim", self.response_field_config.get("latent_dim", 48)))
+            self.response_field = TokenResponseFieldHead(
+                latent_dim=latent_dim,
+                action_flat_dim=action_flat_dim,
+                hidden_dim=int(self.response_field_config.get("hidden_dim", 512)),
+                rank=int(self.response_field_config.get("rank", 8)),
+                spatial_pool=int(self.response_field_config.get("spatial_pool", 2)),
+            )
 
         self.to(self.device)
 
@@ -111,6 +133,8 @@ class FastWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        loss_lambda_response: float = 0.0,
+        response_field_config: dict[str, Any] | None = None,
     ):
         if video_dit_config is None:
             raise ValueError("`video_dit_config` is required for FastWAM.from_wan22_pretrained().")
@@ -168,6 +192,8 @@ class FastWAM(torch.nn.Module):
             action_num_train_timesteps=action_num_train_timesteps,
             loss_lambda_video=loss_lambda_video,
             loss_lambda_action=loss_lambda_action,
+            loss_lambda_response=loss_lambda_response,
+            response_field_config=response_field_config,
         )
         model.model_paths = {
             "video_dit": components.dit_path,
@@ -445,6 +471,41 @@ class FastWAM(torch.nn.Module):
         valid_sum = valid.sum(dim=1).clamp(min=1.0)
         return (video_loss_token * valid).sum(dim=1) / valid_sum
 
+    def _compute_response_field_loss(
+        self,
+        input_latents: torch.Tensor,
+        action: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        if self.response_field is None:
+            zero = input_latents.new_zeros(())
+            return zero, {}
+        if input_latents.shape[2] <= 1:
+            zero = input_latents.new_zeros(())
+            return zero, {}
+
+        spatial_pool = int(self.response_field.spatial_pool)
+        state_tokens = latent_tokens(input_latents[:, :, 0:1], spatial_pool=spatial_pool).to(input_latents.device)
+        future_tokens = latent_tokens(input_latents[:, :, 1:], spatial_pool=spatial_pool).to(input_latents.device)
+        response_batch = nearest_response_batch(
+            state_tokens=state_tokens,
+            action=action,
+            future_tokens=future_tokens,
+        )
+        if response_batch is None:
+            zero = input_latents.new_zeros(())
+            return zero, {}
+
+        state_anchor, action_anchor, delta_action, target_response = response_batch
+        pred_response = self.response_field(
+            state_tokens=state_anchor,
+            action_flat=action_anchor,
+            delta_action_flat=delta_action,
+            target_token_count=target_response.shape[1],
+        )
+        loss_response = F.mse_loss(pred_response.float(), target_response.float())
+        metric_dict = response_metrics(pred_response.detach(), target_response.detach())
+        return loss_response, metric_dict
+
     def training_loss(self, sample, tiled: bool = False):
         inputs = self.build_inputs(sample, tiled=tiled)
         input_latents = inputs["input_latents"]
@@ -560,11 +621,23 @@ class FastWAM(torch.nn.Module):
         )
         loss_action = (action_loss_per_sample * action_weight).mean()
 
-        loss_total = self.loss_lambda_video * loss_video + self.loss_lambda_action * loss_action
+        loss_response, response_metric_dict = self._compute_response_field_loss(
+            input_latents=input_latents,
+            action=action,
+        )
+
+        loss_total = (
+            self.loss_lambda_video * loss_video
+            + self.loss_lambda_action * loss_action
+            + self.loss_lambda_response * loss_response
+        )
         loss_dict = {
             "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
             "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
         }
+        if self.response_field is not None:
+            loss_dict["loss_response"] = self.loss_lambda_response * float(loss_response.detach().item())
+            loss_dict.update(response_metric_dict)
         return loss_total, loss_dict
 
     @torch.no_grad()
@@ -1093,6 +1166,9 @@ class FastWAM(torch.nn.Module):
         }
         if self.proprio_encoder is not None:
             payload["proprio_encoder"] = self.proprio_encoder.state_dict()
+        if self.response_field is not None:
+            payload["response_field"] = self.response_field.state_dict()
+            payload["response_field_config"] = dict(self.response_field_config)
         if optimizer is not None:
             payload["optimizer"] = optimizer.state_dict()
         torch.save(payload, path)
@@ -1113,6 +1189,14 @@ class FastWAM(torch.nn.Module):
                 logger.warning("Checkpoint has no `proprio_encoder` weights; keeping current `proprio_encoder` params.")
         elif "proprio_encoder" in payload:
             logger.warning("Checkpoint contains `proprio_encoder` weights but current model has `proprio_dim=None`; ignoring.")
+
+        if self.response_field is not None:
+            if "response_field" in payload:
+                self.response_field.load_state_dict(payload["response_field"], strict=True)
+            else:
+                logger.warning("Checkpoint has no `response_field` weights; keeping current response field params.")
+        elif "response_field" in payload:
+            logger.warning("Checkpoint contains `response_field` weights but current model has response_field disabled; ignoring.")
 
         if optimizer is not None and "optimizer" in payload:
             optimizer.load_state_dict(payload["optimizer"])

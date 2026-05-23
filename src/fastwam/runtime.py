@@ -85,6 +85,7 @@ def create_fastwam(
     skip_dit_load_from_pretrain: bool = False,
     video_scheduler=None,
     action_scheduler=None,
+    response_field=None,
     loss=None,
     mot_checkpoint_mixed_attn: bool = True,
     redirect_common_files: bool = True,
@@ -133,6 +134,13 @@ def create_fastwam(
     if not isinstance(loss, dict):
         raise ValueError(f"`loss` must be dict-like, got {type(loss)}")
 
+    if isinstance(response_field, DictConfig):
+        response_field = OmegaConf.to_container(response_field, resolve=True)
+    if response_field is None:
+        response_field = {}
+    if not isinstance(response_field, dict):
+        raise ValueError(f"`response_field` must be dict-like, got {type(response_field)}")
+
     return FastWAM.from_wan22_pretrained(
         device=device,
         torch_dtype=model_dtype,
@@ -155,6 +163,8 @@ def create_fastwam(
         action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        loss_lambda_response=float(loss.get("lambda_response", 0.0)),
+        response_field_config=response_field,
     )
 
 
@@ -170,6 +180,7 @@ def create_fastwam_joint(
     skip_dit_load_from_pretrain: bool = False,
     video_scheduler=None,
     action_scheduler=None,
+    response_field=None,
     loss=None,
     mot_checkpoint_mixed_attn: bool = True,
     redirect_common_files: bool = True,
@@ -218,6 +229,13 @@ def create_fastwam_joint(
     if not isinstance(loss, dict):
         raise ValueError(f"`loss` must be dict-like, got {type(loss)}")
 
+    if isinstance(response_field, DictConfig):
+        response_field = OmegaConf.to_container(response_field, resolve=True)
+    if response_field is None:
+        response_field = {}
+    if not isinstance(response_field, dict):
+        raise ValueError(f"`response_field` must be dict-like, got {type(response_field)}")
+
     return FastWAMJoint.from_wan22_pretrained(
         device=device,
         torch_dtype=model_dtype,
@@ -240,6 +258,8 @@ def create_fastwam_joint(
         action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        loss_lambda_response=float(loss.get("lambda_response", 0.0)),
+        response_field_config=response_field,
     )
 
 

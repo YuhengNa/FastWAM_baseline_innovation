@@ -54,5 +54,13 @@ action_scheduler:
   infer_shift: 5.0
   num_train_timesteps: 1000
 
+response_field:
+  enabled: false
+  action_horizon: 32
+  spatial_pool: 2
+  hidden_dim: 512
+  rank: 8
+
 loss:
   lambda_action: 1.0
+  lambda_response: 0.0
