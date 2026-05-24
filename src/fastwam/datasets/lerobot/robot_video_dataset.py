@@ -225,6 +225,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             "action": action,
             "proprio": proprio,
             "prompt": instruction,
+            "idx": sample.get("idx", sample_idx),
             "context": context,
             "context_mask": context_mask,
             "image_is_pad": image_is_pad,

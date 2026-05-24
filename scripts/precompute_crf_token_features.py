@@ -51,6 +51,22 @@ def _token_features(inputs: dict, spatial_pool: int):
     return state_tokens, future_tokens
 
 
+def _episode_phase_from_indices(dataset, indices: torch.Tensor):
+    base = getattr(dataset, "lerobot_dataset", None)
+    if base is None or not hasattr(base, "episode_data_index"):
+        return None, None
+    starts = base.episode_data_index["from"].cpu().long()
+    ends = base.episode_data_index["to"].cpu().long()
+    idx = indices.cpu().long()
+    episode = torch.bucketize(idx, ends, right=False)
+    episode = episode.clamp(max=starts.numel() - 1)
+    start = starts[episode]
+    end = ends[episode]
+    denom = (end - start - 1).clamp(min=1)
+    phase = (idx - start).float() / denom.float()
+    return episode.long(), phase.float()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Precompute spatial/token FastWAM VAE latent features for CRF.")
     parser.add_argument("--config", default="configs/train.yaml")
@@ -80,6 +96,10 @@ def main():
     state_chunks = []
     action_chunks = []
     future_chunks = []
+    idx_chunks = []
+    episode_chunks = []
+    phase_chunks = []
+    prompt_rows = []
     seen = 0
     total = min(len(dataset), args.max_samples) if args.max_samples > 0 else len(dataset)
 
@@ -97,6 +117,18 @@ def main():
         state_chunks.append(state_tokens[:take].cpu())
         action_chunks.append(action_feat[:take].cpu())
         future_chunks.append(future_tokens[:take].cpu())
+        if "idx" in batch:
+            idx = batch["idx"]
+            if not isinstance(idx, torch.Tensor):
+                idx = torch.as_tensor(idx)
+            idx = idx[:take].cpu().long()
+            idx_chunks.append(idx)
+            episode, phase = _episode_phase_from_indices(dataset, idx)
+            if episode is not None:
+                episode_chunks.append(episode)
+                phase_chunks.append(phase)
+        if "prompt" in batch:
+            prompt_rows.extend(list(batch["prompt"])[:take])
         seen += take
         pbar.update(take)
         if seen >= total:
@@ -111,6 +143,13 @@ def main():
         "task": args.task,
         "config": args.config,
     }
+    if idx_chunks:
+        payload["idx"] = torch.cat(idx_chunks, dim=0)
+    if episode_chunks:
+        payload["episode_index"] = torch.cat(episode_chunks, dim=0)
+        payload["episode_phase"] = torch.cat(phase_chunks, dim=0)
+    if prompt_rows:
+        payload["prompt"] = prompt_rows
     save_path = Path(args.save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, save_path)
@@ -120,6 +159,13 @@ def main():
         f"  action_feat={tuple(payload['action_feat'].shape)}\n"
         f"  future_tokens={tuple(payload['future_tokens'].shape)}"
     )
+    if "prompt" in payload:
+        print(f"  prompts={len(set(payload['prompt']))} unique")
+    if "episode_phase" in payload:
+        print(
+            f"  episode_phase=({payload['episode_phase'].min().item():.4f}, "
+            f"{payload['episode_phase'].max().item():.4f})"
+        )
 
 
 if __name__ == "__main__":
